@@ -10,8 +10,8 @@
 
 - 官方 llama.cpp 加载器认不全循环层，必须用改过的构建
 - 光有 `ggml-cuda.dll` 没用，还得装 CUDA 13 运行库，缺了它 `-ngl 99` 是完全白写的
-- 缺运行时的时候它不报错，只是安静地跑在 CPU 上，15 倍慢
-- 补上之后：12.4 tok/s → 53 tok/s
+- 缺运行时的时候它不报错，只是安静地跑在 CPU 上，慢 4 倍多
+- 补上之后：12.4 tok/s → 55.5 tok/s
 
 ## 这模型是什么
 
@@ -31,7 +31,7 @@ Q3 量化后 12.7 GB，加视觉投影层 0.6 GB，16G 卡塞得下，但塞得�
 
 换完构建，能对话了，12.4 tok/s。我以为这就是 16G 卡跑 26B 模型的正常水平，还挺满意。
 
-直到我随手看了一眼 nvidia-smi。
+直到我随手看了一眼 nvidia-smi：
 
 ```
 显存占用：1769 MiB（推理全程不动）
@@ -40,7 +40,7 @@ GPU 利用率：6%
 llama-server 内存：12.76 GB
 ```
 
-**权重 12.76G 全在系统内存里，显卡基本在睡觉。** 12.4 tok/s 是纯 CPU 的成绩，我拿它当 GPU 成绩夸了两天。
+**权重 12.76G 全在系统内存里，显卡基本在睡觉。** 12.4 tok/s 是纯 CPU 的成绩，我拿它当 GPU 成绩夸了三天。
 
 为什么会这样？这个构建确实带了 CUDA 后端，`ggml-cuda.dll` 有 401MB，但它依赖 CUDA 13 的三个运行库：
 
@@ -60,17 +60,14 @@ llama-server.exe --list-devices
 
 ### 怎么补
 
-从 NVIDIA 官方分发包取（不用装整个 Toolkit）：
+从 NVIDIA 官方分发包取，不用装整个 Toolkit：
 
-```
-https://developer.download.nvidia.com/compute/cuda/redist/
-cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.1.80-archive.zip      2.9 MB
-libcublas/windows-x86_64/libcublas-windows-x86_64-13.2.0.9-archive.zip       384 MB
-```
+- [cuda_cudart 13.1（2.9 MB）](https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.1.80-archive.zip)
+- [libcublas 13.2（384 MB）](https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-13.2.0.9-archive.zip)
 
 解压后把三个 dll 从 `bin\x64\` 里捞出来，直接扔进 `llama-server.exe` 所在的目录。不用配环境变量，不用装驱动，重启服务就认。
 
-补完第一件事就是跑 `--list-devices`，看到 `CUDA0` 才算真上卡。加载时间从 60 秒级降到 14 秒，也能当旁证。
+补完第一件事就是跑 `--list-devices`，看到 `CUDA0` 才算真上卡。加载时间从 60 秒级降到 12 秒，也能当旁证。
 
 ## 第三个坑：`-fa` 在这个构建里必须带值
 
@@ -99,7 +96,23 @@ error: unknown value for --flash-attn: '--no-warmup'
 
 生成速度 4 倍多，预填充 3 倍。装运行库这半小时，是整个流程里性价比最高的一步。
 
-（预填充速度在 16K 那档反而略低，是因为上下文开大了注意力计算变重，不是配置问题。）
+（32768 和 65536 那两档我只验证了能起得来、显存够，没测生成速度——日常用不到那么大的上下文。）
+
+### 上卡前后，nvidia-smi 的原样输出
+
+装之前，推理正在跑，显卡在摸鱼：
+
+```
+memory.used 1769 MiB, util 6 %, power 37 W
+```
+
+装之后，同一句提示词：
+
+```
+memory.used 15092 MiB, util 92 %, power 151 W
+```
+
+功耗从 37W 跳到 151W，这个是装没装 CUDA 最直接的旁证。
 
 ## 上下文能开多大
 
@@ -134,15 +147,21 @@ llama-server.exe -m "D:\DSH 对话\AI\gguf\q3.gguf" --mmproj "D:\DSH 对话\AI\g
 - `-fa on` 开 flash attention，必须带值
 - `-ctk q8_0 -ctv q8_0` 把 KV 压到八位，省一半，这是上下文能往上开、同时留出显存余量的原因
 
-Windows 上一键启动脚本见 `start-llama.bat`，改三个路径就能跑。
+Windows 上一键启动脚本见 [`start-llama.bat`](start-llama.bat)，改三个路径就能跑。脚本启动前会先打印设备列表，看到 `(none)` 就说明你也会掉进我踩的那个坑。
 
 ## Q3 的坑：误差会被循环放大
 
 它中间 12 层跑三遍，量化误差跟着放大三遍。
 
-表现是偶尔"想歪"：同一个意思换个说法说三遍，或者刚说完一句又自己否定掉。不是参数调错，是量化太狠。
+表现是偶尔“想歪”：同一个意思换个说法说三遍，或者刚说完一句又自己否定掉。不是参数调错，是量化太狠。
 
-Q3 当"能跑通"的配置，正式用还是 Q4。16G 卡上 Q4 加上 KV 量化，上下文大概要压到 8K 才有余量，这是个取舍。
+Q3 当“能跑通”的配置，正式用还是 Q4。16G 卡上 Q4 加上 KV 量化，上下文大概要压到 8K 才有余量，这是个取舍。
+
+## 显存更小的卡怎么办
+
+这一条我没实测，只写思路：这模型是 128 专家的稀疏 MoE，可以用 `--n-cpu-moe` 把专家层甩到系统内存，只让注意力、路由、共享层留在卡上。显存能掉好几个 G，代价是速度打折。
+
+12G 卡想跑，大概得走这条路，或者退到 Q2。谁试了欢迎在 issue 里报数据。
 
 ## 几句实话
 
@@ -163,4 +182,6 @@ Q3 当"能跑通"的配置，正式用还是 Q4。16G 卡上 Q4 加上 KV 量化
 
 本文与脚本可随意取用。模型本体遵循 Apache 2.0。
 
-> （注：部分内容由豆包 AI 生成）
+---
+
+*排版与文字润色由 AI 辅助，所有实测数据均来自本机复现，采集方式见上文命令。*
